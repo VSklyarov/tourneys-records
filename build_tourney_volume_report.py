@@ -330,6 +330,151 @@ def thin_buckets(buckets: list[dict], max_bins: int = 36) -> list[dict]:
     return out
 
 
+def _nice_step(raw: float) -> float:
+    if raw <= 0 or not math.isfinite(raw):
+        return 1.0
+    exp = math.floor(math.log10(raw))
+    base = 10 ** exp
+    frac = raw / base
+    if frac < 1.5:
+        nice = 1.0
+    elif frac < 3.5:
+        nice = 2.0
+    elif frac < 7.5:
+        nice = 5.0
+    else:
+        nice = 10.0
+    return nice * base
+
+
+def _round_preserve(counts: list[float]) -> list[int]:
+    if not counts:
+        return []
+    floors = [math.floor(c) for c in counts]
+    leftover = int(round(sum(counts))) - sum(floors)
+    order = sorted(range(len(counts)), key=lambda i: (counts[i] - floors[i]), reverse=True)
+    for i in range(max(0, leftover)):
+        floors[order[i % len(order)]] += 1
+    return floors
+
+
+def _overlap_count(rows: list[dict], lo: float, hi: float) -> float:
+    total = 0.0
+    for b in rows:
+        span = float(b["hi"]) - float(b["lo"])
+        olo = max(float(b["lo"]), lo)
+        ohi = min(float(b["hi"]), hi)
+        if ohi > olo and span > 0:
+            total += float(b["count"]) * (ohi - olo) / span
+    return total
+
+
+def _tail_edges(lo: float, hi: float, n: int) -> list[float]:
+    if hi <= lo:
+        return [lo, lo + 1.0]
+    n = max(1, n)
+    if n == 1 or lo <= 0 or hi / lo < 1.4:
+        if n == 1:
+            return [lo, hi]
+        step = (hi - lo) / n
+        return [lo + step * i for i in range(n)] + [hi]
+    ratio = (hi / lo) ** (1.0 / n)
+    if ratio < 1.25:
+        return [lo, hi]
+    edges = [lo]
+    x = lo
+    for _ in range(n - 1):
+        x *= ratio
+        edges.append(x)
+    edges.append(hi)
+    return edges
+
+
+def adaptive_hist_from_bins(buckets: list[dict], mass: float = 0.98, target_bins: int = 28, max_tail: int = 5) -> list[list]:
+    """Fine equal bins through the dense part, then a few wider tail bins.
+
+    Each row is [lo, hi, count, tail]. Tail bars are drawn at the same
+    on-screen width as body bars so a handful of multi-hour outliers
+    cannot stretch the axis.
+    """
+    rows = [
+        {"lo": float(b["lo"]), "hi": float(b["hi"]), "count": float(b["count"])}
+        for b in buckets
+        if float(b.get("count", 0)) > 0 and float(b["hi"]) > float(b["lo"])
+    ]
+    rows.sort(key=lambda b: b["lo"])
+    if not rows:
+        return []
+    total = sum(b["count"] for b in rows)
+    acc = 0.0
+    cut = rows[-1]["hi"]
+    for b in rows:
+        acc += b["count"]
+        if acc >= total * mass:
+            cut = b["hi"]
+            break
+    width0 = min(b["hi"] - b["lo"] for b in rows)
+    span = max(cut - min(0.0, rows[0]["lo"]), width0)
+    step = max(_nice_step(span / target_bins), width0)
+    body_hi = math.ceil(max(cut, step) / step) * step
+    edges = [0.0]
+    x = 0.0
+    while x < body_hi - 1e-9:
+        x = min(body_hi, x + step)
+        edges.append(x)
+    raw_counts = [_overlap_count(rows, edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+    counts = _round_preserve(raw_counts)
+    out = [[edges[i], edges[i + 1], counts[i], 0] for i in range(len(counts))]
+    hi_max = rows[-1]["hi"]
+    if hi_max > body_hi + 1e-6:
+        n_tail = min(max_tail, sum(1 for b in rows if b["hi"] > body_hi))
+        t_edges = _tail_edges(body_hi, hi_max, max(1, n_tail))
+        raw_tail = [_overlap_count(rows, t_edges[i], t_edges[i + 1]) for i in range(len(t_edges) - 1)]
+        tail_counts = _round_preserve(raw_tail)
+        pending = t_edges[0]
+        for i, c in enumerate(tail_counts):
+            if c <= 0:
+                continue
+            out.append([pending, t_edges[i + 1], c, 1])
+            pending = t_edges[i + 1]
+    return out
+
+
+def adaptive_hist_from_values(values: np.ndarray, mass: float = 0.98, target_bins: int = 28, max_tail: int = 5) -> list[list]:
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v) & (v >= 0)]
+    if len(v) < 2:
+        return []
+    cut = float(np.quantile(v, mass))
+    cut = max(cut, float(np.min(v)))
+    span = max(cut, 1.0)
+    step = max(_nice_step(span / target_bins), 1.0)
+    body_hi = math.ceil(max(cut, step) / step) * step
+    edges = np.arange(0.0, body_hi + step * 0.5, step)
+    if len(edges) < 2:
+        edges = np.array([0.0, body_hi])
+    if edges[-1] < body_hi:
+        edges = np.append(edges, body_hi)
+    body = v[v <= body_hi]
+    counts, edges = np.histogram(body, bins=edges)
+    out = [[float(edges[i]), float(edges[i + 1]), int(counts[i]), 0] for i in range(len(counts))]
+    tail_vals = v[v > body_hi]
+    if len(tail_vals):
+        hi_max = float(tail_vals.max())
+        n_tail = min(max_tail, len(tail_vals))
+        t_edges = _tail_edges(body_hi, hi_max, max(1, n_tail))
+        # right edge inclusive
+        t_edges[-1] = max(t_edges[-1], hi_max)
+        t_counts, t_edges_arr = np.histogram(tail_vals, bins=np.asarray(t_edges, dtype=np.float64))
+        pending = float(t_edges_arr[0])
+        for i, c in enumerate(t_counts):
+            if int(c) <= 0:
+                continue
+            out.append([pending, float(t_edges_arr[i + 1]), int(c), 1])
+            pending = float(t_edges_arr[i + 1])
+    return out
+
+
 def histogram(arr: np.ndarray, bins: int = 24) -> list[dict]:
     if len(arr) == 0:
         return []
@@ -468,6 +613,8 @@ def build_limits(
         dstats, _ = duration_from_agg(rsr, dur_stats, dur_buckets)
         kde_tourney = kde_1d_sample(n_arr.astype(np.float64))
         kde_duration = kde_from_histogram_bins(raw_dur_buckets) if len(raw_dur_buckets) >= 3 else []
+        hist_tourney = adaptive_hist_from_values(n_arr.astype(np.float64))
+        hist_duration = adaptive_hist_from_bins(raw_dur_buckets) if raw_dur_buckets else []
 
         limits.append(
             {
@@ -479,6 +626,8 @@ def build_limits(
                 "stats": stats,
                 "kde_tourney": kde_tourney,
                 "kde_duration": kde_duration,
+                "hist_tourney": hist_tourney,
+                "hist_duration": hist_duration,
                 "top30": top_rows,
                 "duration": dstats,
                 "players_pools": int(len(sub)),
@@ -563,6 +712,8 @@ def render_html(limits: list[dict], meta: dict) -> str:
         chart_payload[sid] = {
             "tourney": lim.get("kde_tourney") or [],
             "duration": lim.get("kde_duration") or [],
+            "tourneyHist": lim.get("hist_tourney") or [],
+            "durationHist": lim.get("hist_duration") or [],
         }
 
     cards = []
@@ -596,7 +747,7 @@ def render_html(limits: list[dict], meta: dict) -> str:
         <div><dt>Max</dt><dd>{fmt_num(st['max'], 0)}</dd></div>
       </dl>
       <div class="echart-box" id="chart-tourney-{sid}" data-chart-role="tourney"></div>
-      <p class="hist-label">KDE (Gaussian, Silverman bandwidth) of tournaments per pool</p>
+      <p class="hist-label">{'Share of player×pool pairs. Gold bars are equal steps through the dense part; orange bars are a coarser tail, drawn at the same width.' if lim.get('hist_tourney') else 'KDE (Gaussian, Silverman bandwidth) of tournaments per pool'}</p>
     </div>
     <div>
       <h3 style="margin:0;font-size:1rem;">Tournament duration</h3>
@@ -609,7 +760,7 @@ def render_html(limits: list[dict], meta: dict) -> str:
         <div><dt>P10 / P90</dt><dd>{fmt_num(du.get('p10_min')) if du else '—'} / {fmt_num(du.get('p90_min')) if du else '—'} min</dd></div>
       </dl>
       <div class="echart-box" id="chart-dur-{sid}" data-chart-role="duration"></div>
-      <p class="hist-label">KDE from 2-minute duration bins (approx.) — sparse for very fast formats</p>
+      <p class="hist-label">{'Share of tournaments. Gold bars are equal steps through the dense part; orange bars are a coarser tail, drawn at the same width.' if lim.get('hist_duration') else 'KDE from 2-minute duration bins (approx.) — sparse for very fast formats'}</p>
     </div>
   </div>
   <h3 style="margin:24px 0 8px;font-size:1rem;">Top 30 (single pool period)</h3>
@@ -775,6 +926,99 @@ tbody td:nth-child(2) {{ text-align: left; }}
       }}] : []
     }};
   }}
+  function fmtInt(n) {{
+    return String(Math.round(n)).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, " ");
+  }}
+  function fmtEdge(x) {{
+    if (!isFinite(x)) return "";
+    const ax = Math.abs(x);
+    if (ax >= 1000) {{
+      const v = Math.round(x / 100) / 10;
+      return String(v) + "k";
+    }}
+    if (Math.abs(x - Math.round(x)) < 0.05) return String(Math.round(x));
+    return String(Math.round(x * 10) / 10);
+  }}
+  function makeHistOption(bins, xName, unit) {{
+    const total = bins.reduce(function (s, b) {{ return s + b[2]; }}, 0) || 1;
+    const fineCount = bins.filter(function (b) {{ return !b[3]; }}).length || bins.length;
+    const labelEvery = Math.max(1, Math.ceil(fineCount / 8));
+    const labels = [];
+    const data = [];
+    let cdf = 0;
+    let seenTail = false;
+    let fineIndex = 0;
+    bins.forEach(function (b) {{
+      const tail = !!b[3];
+      if (tail && !seenTail) {{
+        labels.push(" ");
+        data.push({{ value: null }});
+        seenTail = true;
+      }}
+      const share = b[2] / total;
+      const left = cdf;
+      cdf += share;
+      const wide = tail && (b[1] - b[0]) > Math.max(b[0], 1);
+      let label = "";
+      if (tail) label = wide ? fmtEdge(b[0]) + "+" : fmtEdge(b[0]) + "–" + fmtEdge(b[1]);
+      else if (fineIndex % labelEvery === 0) label = fmtEdge(b[0]);
+      labels.push(label);
+      data.push({{
+        value: share * 100,
+        lo: b[0],
+        hi: b[1],
+        n: b[2],
+        left: left,
+        right: Math.max(0, 1 - cdf),
+        wide: wide,
+        itemStyle: {{ color: tail ? "rgba(240,120,72,0.9)" : "rgba(224,177,90,0.92)" }}
+      }});
+      if (!tail) fineIndex += 1;
+    }});
+    return {{
+      animation: false,
+      backgroundColor: "#FFFBF5",
+      textStyle: {{ color: INK }},
+      grid: {{ left: 52, right: 12, top: 28, bottom: 48 }},
+      tooltip: {{
+        trigger: "item",
+        formatter: function (p) {{
+          const d = p.data;
+          if (!d || d.value == null) return "";
+          const range = d.wide ? fmtEdge(d.lo) + "+" : fmtEdge(d.lo) + "–" + fmtEdge(d.hi);
+          return xName + ": <b>" + range + "</b><br/>"
+            + fmtPct(d.value / 100) + " · " + fmtInt(d.n) + " " + unit
+            + "<br/>Left " + fmtPct(d.left) + " · Right " + fmtPct(d.right);
+        }}
+      }},
+      xAxis: {{
+        type: "category",
+        data: labels,
+        name: xName,
+        nameLocation: "middle",
+        nameGap: 32,
+        nameTextStyle: {{ color: AXIS, fontSize: 11 }},
+        axisLine: {{ lineStyle: {{ color: GRID }} }},
+        axisTick: {{ show: false }},
+        splitLine: {{ show: false }},
+        axisLabel: {{ color: AXIS, interval: 0, hideOverlap: true }}
+      }},
+      yAxis: {{
+        type: "value",
+        min: 0,
+        name: "%",
+        nameTextStyle: {{ color: AXIS, fontSize: 11 }},
+        axisLine: {{ lineStyle: {{ color: GRID }} }},
+        splitLine: {{ lineStyle: {{ color: GRID, opacity: 0.6 }} }},
+        axisLabel: {{ color: AXIS }}
+      }},
+      series: [{{
+        type: "bar",
+        barCategoryGap: "28%",
+        data: data
+      }}]
+    }};
+  }}
   function renderChartsForVisible() {{
     document.querySelectorAll(".limit-card:not(.is-hidden)").forEach(function (card) {{
       const id = card.id;
@@ -786,13 +1030,19 @@ tbody td:nth-child(2) {{ text-align: left; }}
       if (elD && elD.__chart) {{ elD.__chart.dispose(); elD.__chart = null; }}
       if (elT && typeof echarts !== "undefined") {{
         const c = echarts.init(elT);
-        c.setOption(makeKdeOption(payload.tourney, "Tournaments / pool"));
+        if (payload.tourneyHist && payload.tourneyHist.length > 1) {{
+          c.setOption(makeHistOption(payload.tourneyHist, "Tournaments / pool", "pairs"));
+        }} else {{
+          c.setOption(makeKdeOption(payload.tourney, "Tournaments / pool"));
+        }}
         elT.__chart = c;
       }}
       if (elD && typeof echarts !== "undefined") {{
         const c = echarts.init(elD);
         const d = payload.duration;
-        if (d && d.length > 1) {{
+        if (payload.durationHist && payload.durationHist.length > 1) {{
+          c.setOption(makeHistOption(payload.durationHist, "Minutes", "tournaments"));
+        }} else if (d && d.length > 1) {{
           c.setOption(makeKdeOption(d, "Minutes"));
         }} else {{
           c.setOption({{
