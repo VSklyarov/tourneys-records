@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/pool-tourney-volume-record.html"
+    }
+  ]
+}
